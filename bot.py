@@ -6,6 +6,8 @@ import yt_dlp
 from datetime import timedelta
 import os
 import json
+import time
+import random
 from dotenv import load_dotenv
 
 # ==========================================
@@ -27,8 +29,11 @@ bot = discord.Bot(intents=intents)
 SAYMA_VERI_DOSYASI = "sayma_verisi.json"
 HABER_VERI_DOSYASI = "haber_kanallari.json"
 KARSILAMA_VERI_DOSYASI = "karsilama_kanallari.json"
+SEVIYE_VERI_DOSYASI = "seviye_verisi.json"
+SEVIYE_ROL_DOSYASI = "seviye_rolleri.json"
+MODUL_VERI_DOSYASI = "modul_ayarlari.json"
 
-# Eşzamanlı dosya yazma çakışmalarını önlemek için kilit
+# Race-condition (dosya çakışması) engellemek için async kilit
 dosya_kilidi = asyncio.Lock()
 
 def veriyi_oku(dosya_adi):
@@ -45,7 +50,6 @@ def veriyi_kaydet(dosya_adi, veri):
         json.dump(veri, f, ensure_ascii=False, indent=4)
 
 async def veriyi_kaydet_async(dosya_adi, veri):
-    # Race-condition engellemek için async kilit
     async with dosya_kilidi:
         await asyncio.to_thread(veriyi_kaydet, dosya_adi, veri)
 
@@ -53,13 +57,48 @@ async def veriyi_kaydet_async(dosya_adi, veri):
 sayma_verileri = veriyi_oku(SAYMA_VERI_DOSYASI)
 haber_kanallari = veriyi_oku(HABER_VERI_DOSYASI)
 karsilama_kanallari = veriyi_oku(KARSILAMA_VERI_DOSYASI)
+seviye_verileri = veriyi_oku(SEVIYE_VERI_DOSYASI)
+seviye_rolleri = veriyi_oku(SEVIYE_ROL_DOSYASI)
+modul_ayarlari = veriyi_oku(MODUL_VERI_DOSYASI)
 
 muzik_hafizasi = {}
+xp_cooldown = {} # { "guild_id_user_id": timestamp }
 
 def get_muzik_veri(guild_id: int):
     if guild_id not in muzik_hafizasi:
         muzik_hafizasi[guild_id] = {"kuyruk": [], "su_an_calan": None}
     return muzik_hafizasi[guild_id]
+
+# Varsayılan olarak tüm modüller AÇIK (True) varsayılır
+# Modül isimleri: "karsilama", "sayma", "rss", "muzik", "seviye", "moderasyon"
+def modul_aktif_mi(guild_id: int, modul_adi: str) -> bool:
+    g_id = str(guild_id)
+    return modul_ayarlari.get(g_id, {}).get(modul_adi, True)
+
+# ==========================================
+# 0. MODÜL AÇMA / KAPATMA SİSTEMİ
+# ==========================================
+@bot.slash_command(name="ayar-modul", description="Botun sistemlerini açıp kapatmanızı sağlar")
+@discord.default_permissions(administrator=True)
+async def ayar_modul(
+    ctx: discord.ApplicationContext, 
+    modul: discord.Option(str, "Değiştirmek istediğiniz modül", choices=["karsilama", "sayma", "rss", "muzik", "seviye", "moderasyon"]), # type: ignore
+    durum: discord.Option(bool, "Açık (True) veya Kapalı (False)") # type: ignore
+):
+    await ctx.defer(ephemeral=True)
+
+    if not ctx.author.guild_permissions.administrator:
+        return await ctx.followup.send("❌ Bu komutu sadece `Yönetici` yetkisine sahip kişiler kullanabilir!", ephemeral=True)
+
+    guild_id = str(ctx.guild.id)
+    if guild_id not in modul_ayarlari:
+        modul_ayarlari[guild_id] = {}
+
+    modul_ayarlari[guild_id][modul] = durum
+    await veriyi_kaydet_async(MODUL_VERI_DOSYASI, modul_ayarlari)
+
+    durum_metni = "🟢 **AÇIK**" if durum else "🔴 **KAPALI**"
+    await ctx.followup.send(f"⚙️ **{modul.upper()}** modülü bu sunucu için {durum_metni} duruma getirildi.", ephemeral=True)
 
 # ==========================================
 # 1. HOŞ GELDİN (KARŞILAMA) SİSTEMİ
@@ -68,8 +107,9 @@ def get_muzik_veri(guild_id: int):
 @discord.default_permissions(manage_channels=True)
 async def karsilama_kanali_ayarla(ctx: discord.ApplicationContext, kanal: discord.TextChannel):
     await ctx.defer(ephemeral=True)
-    
-    # Kod içi yetki kontrolü
+    if not modul_aktif_mi(ctx.guild.id, "karsilama"):
+        return await ctx.followup.send("❌ **Karşılama** modülü bu sunucuda kapalı!", ephemeral=True)
+
     if not ctx.author.guild_permissions.manage_channels:
         return await ctx.followup.send("❌ Bu komutu kullanmak için `Kanalları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
 
@@ -81,6 +121,9 @@ async def karsilama_kanali_ayarla(ctx: discord.ApplicationContext, kanal: discor
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    if not modul_aktif_mi(member.guild.id, "karsilama"):
+        return
+
     guild_id = str(member.guild.id)
 
     kanal_id = karsilama_kanallari.get(guild_id)
@@ -103,7 +146,7 @@ async def on_member_join(member: discord.Member):
             try:
                 await kanal.send(content=f"Hoş geldin {member.mention}!", embed=embed_kanal)
             except discord.Forbidden:
-                print(f"[KARŞILAMA HATA] {kanal.name} kanalına mesaj gönderilemedi (Yetki eksik).")
+                pass
 
     embed_dm = discord.Embed(
         title=f"🎉 Sunucumuza Hoş Geldin, {member.name}!",
@@ -126,13 +169,15 @@ async def on_member_join(member: discord.Member):
         pass
 
 # ==========================================
-# 2. SAYMA (COUNTING) SİSTEMİ
+# 2. SAYMA VE SEVİYE SİSTEMİ (ON_MESSAGE)
 # ==========================================
 @bot.slash_command(name="sayma-kanali-ayarla", description="Sayma oyununun oynanacağı kanalı belirler")
 @discord.default_permissions(manage_channels=True)
 async def sayma_kanali_ayarla(ctx: discord.ApplicationContext, kanal: discord.TextChannel):
     await ctx.defer(ephemeral=True)
-    
+    if not modul_aktif_mi(ctx.guild.id, "sayma"):
+        return await ctx.followup.send("❌ **Sayma** modülü bu sunucuda kapalı!", ephemeral=True)
+
     if not ctx.author.guild_permissions.manage_channels:
         return await ctx.followup.send("❌ Bu komutu kullanmak için `Kanalları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
 
@@ -152,39 +197,154 @@ async def on_message(message: discord.Message):
         return
 
     guild_id = str(message.guild.id)
-    guild_sayma = sayma_verileri.get(guild_id)
+    user_id = str(message.author.id)
 
-    if guild_sayma and guild_sayma.get("kanal_id") == message.channel.id:
-        içerik = message.content.strip()
+    # --- A) SEVİYE & XP KAZANMA SİSTEMİ ---
+    if modul_aktif_mi(message.guild.id, "seviye"):
+        cooldown_key = f"{guild_id}_{user_id}"
+        simdiki_zaman = time.time()
 
-        if içerik.isdigit():
-            girilen_sayi = int(içerik)
-            beklenen_sayi = guild_sayma["mevcut_sayi"] + 1
+        # 60 Saniye Spam Koruması
+        if cooldown_key not in xp_cooldown or (simdiki_zaman - xp_cooldown[cooldown_key]) >= 60:
+            xp_cooldown[cooldown_key] = simdiki_zaman
 
-            if message.author.id == guild_sayma.get("son_kullanici_id"):
-                await message.add_reaction("❌")
-                guild_sayma["mevcut_sayi"] = 0
-                guild_sayma["son_kullanici_id"] = None
-                await veriyi_kaydet_async(SAYMA_VERI_DOSYASI, sayma_verileri)
-                await message.channel.send(f"⚠️ **{message.author.mention}**, üst üste iki kez sayı yazamazsın! Sayma sıfırlandı. Tekrar **1** yazarak başlayın.")
-                return
+            if guild_id not in seviye_verileri:
+                seviye_verileri[guild_id] = {}
+            if user_id not in seviye_verileri[guild_id]:
+                seviye_verileri[guild_id][user_id] = {"xp": 0, "level": 0}
 
-            if girilen_sayi == beklenen_sayi:
-                await message.add_reaction("✅")
-                guild_sayma["mevcut_sayi"] = girilen_sayi
-                guild_sayma["son_kullanici_id"] = message.author.id
-                await veriyi_kaydet_async(SAYMA_VERI_DOSYASI, sayma_verileri)
-            else:
-                await message.add_reaction("❌")
-                guild_sayma["mevcut_sayi"] = 0
-                guild_sayma["son_kullanici_id"] = None
-                await veriyi_kaydet_async(SAYMA_VERI_DOSYASI, sayma_verileri)
-                await message.channel.send(f"❌ **Yanlış sayı!** Beklenen sayı `{beklenen_sayi}` idi ama `{girilen_sayi}` yazıldı. Sayma sıfırlandı! Tekrar **1** ile başlayın.")
+            kullanici_veri = seviye_verileri[guild_id][user_id]
+            kullanici_veri["xp"] += random.randint(15, 25)
+
+            mevcut_seviye = kullanici_veri["level"]
+            gereken_xp = (mevcut_seviye + 1) * 100
+
+            if kullanici_veri["xp"] >= gereken_xp:
+                kullanici_veri["level"] += 1
+                yeni_seviye = kullanici_veri["level"]
+                await veriyi_kaydet_async(SEVIYE_VERI_DOSYASI, seviye_verileri)
+
+                await message.channel.send(f"🎉 Tebrikler {message.author.mention}! **Seviye {yeni_seviye}** seviyesine ulaştın!")
+
+                # Otomatik Rol Ödülü
+                guild_rolleri = seviye_rolleri.get(guild_id, {})
+                if str(yeni_seviye) in guild_rolleri:
+                    rol_id = guild_rolleri[str(yeni_seviye)]
+                    rol = message.guild.get_role(rol_id)
+                    if rol:
+                        try:
+                            await message.author.add_roles(rol)
+                            await message.channel.send(f"🏅 **Ödül Rolü:** {message.author.mention}, **{rol.name}** rolünü kazandın!")
+                        except discord.Forbidden:
+                            pass
+
+            await veriyi_kaydet_async(SEVIYE_VERI_DOSYASI, seviye_verileri)
+
+    # --- B) SAYMA OYUNU SİSTEMİ ---
+    if modul_aktif_mi(message.guild.id, "sayma"):
+        guild_sayma = sayma_verileri.get(guild_id)
+
+        if guild_sayma and guild_sayma.get("kanal_id") == message.channel.id:
+            içerik = message.content.strip()
+
+            if içerik.isdigit():
+                girilen_sayi = int(içerik)
+                beklenen_sayi = guild_sayma["mevcut_sayi"] + 1
+
+                if message.author.id == guild_sayma.get("son_kullanici_id"):
+                    await message.add_reaction("❌")
+                    guild_sayma["mevcut_sayi"] = 0
+                    guild_sayma["son_kullanici_id"] = None
+                    await veriyi_kaydet_async(SAYMA_VERI_DOSYASI, sayma_verileri)
+                    await message.channel.send(f"⚠️ **{message.author.mention}**, üst üste iki kez sayı yazamazsın! Sayma sıfırlandı. Tekrar **1** yazarak başlayın.")
+                    return
+
+                if girilen_sayi == beklenen_sayi:
+                    await message.add_reaction("✅")
+                    guild_sayma["mevcut_sayi"] = girilen_sayi
+                    guild_sayma["son_kullanici_id"] = message.author.id
+                    await veriyi_kaydet_async(SAYMA_VERI_DOSYASI, sayma_verileri)
+                else:
+                    await message.add_reaction("❌")
+                    guild_sayma["mevcut_sayi"] = 0
+                    guild_sayma["son_kullanici_id"] = None
+                    await veriyi_kaydet_async(SAYMA_VERI_DOSYASI, sayma_verileri)
+                    await message.channel.send(f"❌ **Yanlış sayı!** Beklenen sayı `{beklenen_sayi}` idi ama `{girilen_sayi}` yazıldı. Sayma sıfırlandı! Tekrar **1** ile başlayın.")
 
     await bot.process_commands(message)
 
 # ==========================================
-# 3. RSS HABER SİSTEMİ
+# 3. SEVİYE KOMUTLARI
+# ==========================================
+@bot.slash_command(name="seviye", description="Sizin veya başka bir üyenin seviyesini/XP durumunu gösterir")
+async def seviye(ctx: discord.ApplicationContext, üye: discord.Member = None):
+    await ctx.defer()
+    if not modul_aktif_mi(ctx.guild.id, "seviye"):
+        return await ctx.followup.send("❌ **Seviye** modülü bu sunucuda kapalı!", ephemeral=True)
+
+    target = üye or ctx.author
+    guild_id = str(ctx.guild.id)
+    user_id = str(target.id)
+
+    user_data = seviye_verileri.get(guild_id, {}).get(user_id, {"xp": 0, "level": 0})
+    mevcut_xp = user_data["xp"]
+    mevcut_seviye = user_data["level"]
+    gereken_xp = (mevcut_seviye + 1) * 100
+
+    embed = discord.Embed(title=f"📊 {target.display_name} - Seviye Bilgisi", color=discord.Color.blue())
+    if target.display_avatar:
+        embed.set_thumbnail(url=target.display_avatar.url)
+
+    embed.add_field(name="🎖️ Seviye", value=f"**{mevcut_seviye}**", inline=True)
+    embed.add_field(name="✨ Toplam XP", value=f"**{mevcut_xp}**", inline=True)
+    embed.add_field(name="🎯 Sonraki Seviye İçin", value=f"`{mevcut_xp} / {gereken_xp} XP`", inline=False)
+
+    await ctx.followup.send(embed=embed)
+
+@bot.slash_command(name="seviye-rol-ekle", description="Belirli bir seviyeye ulaşıldığında verilecek ödül rolünü ayarlar")
+@discord.default_permissions(manage_roles=True)
+async def seviye_rol_ekle(ctx: discord.ApplicationContext, seviye: int, rol: discord.Role):
+    await ctx.defer(ephemeral=True)
+    if not modul_aktif_mi(ctx.guild.id, "seviye"):
+        return await ctx.followup.send("❌ **Seviye** modülü bu sunucuda kapalı!", ephemeral=True)
+
+    if not ctx.author.guild_permissions.manage_roles:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Rolleri Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
+
+    guild_id = str(ctx.guild.id)
+    if guild_id not in seviye_rolleri:
+        seviye_rolleri[guild_id] = {}
+
+    seviye_rolleri[guild_id][str(seviye)] = rol.id
+    await veriyi_kaydet_async(SEVIYE_ROL_DOSYASI, seviye_rolleri)
+
+    await ctx.followup.send(f"✅ **Seviye {seviye}** ödülü olarak {rol.mention} rolü başarıyla ayarlandı!", ephemeral=True)
+
+@bot.slash_command(name="liderlik-tablosu", description="Sunucudaki en yüksek seviyeli 10 kişiyi gösterir")
+async def liderlik_tablosu(ctx: discord.ApplicationContext):
+    await ctx.defer()
+    if not modul_aktif_mi(ctx.guild.id, "seviye"):
+        return await ctx.followup.send("❌ **Seviye** modülü bu sunucuda kapalı!", ephemeral=True)
+
+    guild_id = str(ctx.guild.id)
+    guild_data = seviye_verileri.get(guild_id, {})
+
+    if not guild_data:
+        return await ctx.followup.send("📜 Henüz bu sunucuda kimse XP kazanmadı.")
+
+    sirali = sorted(guild_data.items(), key=lambda x: x[1]["xp"], reverse=True)[:10]
+
+    description = ""
+    for idx, (u_id, data) in enumerate(sirali, start=1):
+        member = ctx.guild.get_member(int(u_id))
+        isim = member.mention if member else f"Bilinmeyen Kullanıcı ({u_id})"
+        description += f"**{idx}.** {isim} — **Seviye {data['level']}** *(XP: {data['xp']})*\n"
+
+    embed = discord.Embed(title=f"🏆 {ctx.guild.name} - Seviye Liderlik Tablosu", description=description, color=discord.Color.gold())
+    await ctx.followup.send(embed=embed)
+
+# ==========================================
+# 4. RSS HABER SİSTEMİ
 # ==========================================
 HABER_KAYNAKLARI = [
     {"ad": "The Verge", "url": "https://www.theverge.com/rss/index.xml", "renk": discord.Color.purple()},
@@ -200,7 +360,9 @@ gonderilen_haberler = []
 @discord.default_permissions(manage_channels=True)
 async def kanal_ayarla(ctx: discord.ApplicationContext, kanal: discord.TextChannel):
     await ctx.defer(ephemeral=True)
-    
+    if not modul_aktif_mi(ctx.guild.id, "rss"):
+        return await ctx.followup.send("❌ **RSS Haber** modülü bu sunucuda kapalı!", ephemeral=True)
+
     if not ctx.author.guild_permissions.manage_channels:
         return await ctx.followup.send("❌ Bu komutu kullanmak için `Kanalları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
 
@@ -234,17 +396,19 @@ async def rss_kontrol():
                     embed.set_author(name=f"🌐 {kaynak['ad']}")
 
                     for guild_id, kanal_id in list(haber_kanallari.items()):
-                        kanal = bot.get_channel(kanal_id)
-                        if kanal:
-                            try:
-                                await kanal.send(embed=embed)
-                            except discord.Forbidden:
-                                pass
+                        # Sunucuda RSS açık mı kontrol et
+                        if modul_aktif_mi(int(guild_id), "rss"):
+                            kanal = bot.get_channel(kanal_id)
+                            if kanal:
+                                try:
+                                    await kanal.send(embed=embed)
+                                except discord.Forbidden:
+                                    pass
         except Exception as e:
             print(f"[RSS HATA] {kaynak['ad']} işlenirken hata: {e}")
 
 # ==========================================
-# 4. MÜZİK SİSTEMİ (SES KANALI GÜVENLİĞİ EKLENDİ)
+# 5. MÜZİK SİSTEMİ
 # ==========================================
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
@@ -264,7 +428,7 @@ ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 def sonraki_sarkiyi_cal(ctx):
     guild_id = ctx.guild.id
     m_veri = get_muzik_veri(guild_id)
-    
+
     if len(m_veri["kuyruk"]) > 0:
         sonraki_sarki = m_veri["kuyruk"].pop(0)
         m_veri["su_an_calan"] = sonraki_sarki['title']
@@ -278,7 +442,10 @@ def sonraki_sarkiyi_cal(ctx):
         m_veri["su_an_calan"] = None
 
 async def ses_kanali_kontrol(ctx: discord.ApplicationContext) -> bool:
-    """Kullanıcının ve botun ses kanalı durumlarını denetler."""
+    if not modul_aktif_mi(ctx.guild.id, "muzik"):
+        await ctx.followup.send("❌ **Müzik** modülü bu sunucuda kapalı!", ephemeral=True)
+        return False
+
     if not ctx.author.voice or not ctx.author.voice.channel:
         await ctx.followup.send("❌ Bu komutu kullanmak için bir ses kanalında olmalısınız!", ephemeral=True)
         return False
@@ -292,14 +459,15 @@ async def ses_kanali_kontrol(ctx: discord.ApplicationContext) -> bool:
 @bot.slash_command(name="oynat", description="Şarkı çalar veya sıraya ekler")
 async def oynat(ctx: discord.ApplicationContext, arama: str):
     await ctx.defer()
-    
+    if not modul_aktif_mi(ctx.guild.id, "muzik"):
+        return await ctx.followup.send("❌ **Müzik** modülü bu sunucuda kapalı!", ephemeral=True)
+
     if not ctx.author.voice or not ctx.author.voice.channel:
         return await ctx.followup.send("❌ Önce bir ses kanalına katılmalısınız!", ephemeral=True)
 
     voice_channel = ctx.author.voice.channel
     voice_client = ctx.voice_client
 
-    # Ses kanalına bağlanma / kanal değiştirme kontrolü
     if not voice_client:
         voice_client = await voice_channel.connect()
     elif voice_client.channel != voice_channel:
@@ -309,7 +477,6 @@ async def oynat(ctx: discord.ApplicationContext, arama: str):
 
     try:
         info = await asyncio.to_thread(lambda: ytdl.extract_info(f"ytsearch:{arama}", download=False))
-        
         if 'entries' in info and len(info['entries']) > 0:
             sarki = info['entries'][0]
         else:
@@ -364,6 +531,9 @@ async def atla(ctx: discord.ApplicationContext):
 @bot.slash_command(name="liste", description="Müzik kuyruğunu gösterir")
 async def liste(ctx: discord.ApplicationContext):
     await ctx.defer()
+    if not modul_aktif_mi(ctx.guild.id, "muzik"):
+        return await ctx.followup.send("❌ **Müzik** modülü bu sunucuda kapalı!", ephemeral=True)
+
     m_veri = get_muzik_veri(ctx.guild.id)
     kuyruk = m_veri["kuyruk"]
     su_an_calan = m_veri["su_an_calan"]
@@ -399,12 +569,14 @@ async def dur(ctx: discord.ApplicationContext):
         await ctx.followup.send("❌ Zaten bir ses kanalında değilim.")
 
 # ==========================================
-# 5. MODERASYON KOMUTLARI (HİYERARŞİ VE YETKİ KONTROLÜ)
+# 6. MODERASYON KOMUTLARI
 # ==========================================
 @bot.slash_command(name="clear", description="Belirtilen miktarda mesajı siler")
 @discord.default_permissions(manage_messages=True)
 async def clear(ctx: discord.ApplicationContext, miktar: int):
     await ctx.defer(ephemeral=True)
+    if not modul_aktif_mi(ctx.guild.id, "moderasyon"):
+        return await ctx.followup.send("❌ **Moderasyon** modülü bu sunucuda kapalı!", ephemeral=True)
 
     if not ctx.author.guild_permissions.manage_messages:
         return await ctx.followup.send("❌ Bu komut için `Mesajları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
@@ -424,11 +596,12 @@ async def clear(ctx: discord.ApplicationContext, miktar: int):
 @discord.default_permissions(kick_members=True)
 async def kick(ctx: discord.ApplicationContext, üye: discord.Member, sebep: str = "Belirtilmedi"):
     await ctx.defer()
+    if not modul_aktif_mi(ctx.guild.id, "moderasyon"):
+        return await ctx.followup.send("❌ **Moderasyon** modülü bu sunucuda kapalı!", ephemeral=True)
 
     if not ctx.author.guild_permissions.kick_members:
         return await ctx.followup.send("❌ Bu komutu kullanmak için `Üyeleri At` yetkisine sahip olmalısınız!", ephemeral=True)
 
-    # Rol Hiyerarşisi Kontrolü
     if üye.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
         return await ctx.followup.send("❌ Sizinle aynı veya sizden daha yüksek roldeki birini atamazsınız!", ephemeral=True)
 
@@ -445,11 +618,12 @@ async def kick(ctx: discord.ApplicationContext, üye: discord.Member, sebep: str
 @discord.default_permissions(ban_members=True)
 async def ban(ctx: discord.ApplicationContext, üye: discord.Member, sebep: str = "Belirtilmedi"):
     await ctx.defer()
+    if not modul_aktif_mi(ctx.guild.id, "moderasyon"):
+        return await ctx.followup.send("❌ **Moderasyon** modülü bu sunucuda kapalı!", ephemeral=True)
 
     if not ctx.author.guild_permissions.ban_members:
         return await ctx.followup.send("❌ Bu komutu kullanmak için `Üyeleri Yasakla` yetkisine sahip olmalısınız!", ephemeral=True)
 
-    # Rol Hiyerarşisi Kontrolü
     if üye.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
         return await ctx.followup.send("❌ Sizinle aynı veya sizden daha yüksek roldeki birini yasaklayamazsınız!", ephemeral=True)
 
@@ -466,11 +640,12 @@ async def ban(ctx: discord.ApplicationContext, üye: discord.Member, sebep: str 
 @discord.default_permissions(moderate_members=True)
 async def mute(ctx: discord.ApplicationContext, üye: discord.Member, dakika: int, sebep: str = "Belirtilmedi"):
     await ctx.defer()
+    if not modul_aktif_mi(ctx.guild.id, "moderasyon"):
+        return await ctx.followup.send("❌ **Moderasyon** modülü bu sunucuda kapalı!", ephemeral=True)
 
     if not ctx.author.guild_permissions.moderate_members:
         return await ctx.followup.send("❌ Bu komutu kullanmak için `Üyeleri Zamana Aşımına Uğrat` yetkisine sahip olmalısınız!", ephemeral=True)
 
-    # Rol Hiyerarşisi Kontrolü
     if üye.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
         return await ctx.followup.send("❌ Sizinle aynı veya sizden daha yüksek roldeki birini susturamazsınız!", ephemeral=True)
 
@@ -488,6 +663,8 @@ async def mute(ctx: discord.ApplicationContext, üye: discord.Member, dakika: in
 @discord.default_permissions(moderate_members=True)
 async def unmute(ctx: discord.ApplicationContext, üye: discord.Member):
     await ctx.defer()
+    if not modul_aktif_mi(ctx.guild.id, "moderasyon"):
+        return await ctx.followup.send("❌ **Moderasyon** modülü bu sunucuda kapalı!", ephemeral=True)
 
     if not ctx.author.guild_permissions.moderate_members:
         return await ctx.followup.send("❌ Bu komutu kullanmak için `Üyeleri Zamana Aşımına Uğrat` yetkisine sahip olmalısınız!", ephemeral=True)
@@ -499,7 +676,7 @@ async def unmute(ctx: discord.ApplicationContext, üye: discord.Member):
         await ctx.followup.send(f"❌ Susturma kaldırılamadı: {e}")
 
 # ==========================================
-# 6. YARDIM MENÜSÜ
+# 7. YARDIM MENÜSÜ
 # ==========================================
 @bot.slash_command(name="yardim", description="Tüm komutları gösterir")
 async def yardim(ctx: discord.ApplicationContext):
@@ -511,8 +688,24 @@ async def yardim(ctx: discord.ApplicationContext):
     )
 
     embed.add_field(
+        name="⚙️ Sistem Yönetimi",
+        value="`/ayar-modul <modül_adı> <True/False>` - İstediğiniz sistemi sunucunuzda açar veya kapatır.",
+        inline=False
+    )
+
+    embed.add_field(
         name="👋 Karşılama Sistemi",
         value="`/karsilama-kanali-ayarla #kanal` - Yeni gelen üyelerin karşılanacağı kanalı ayarlar.",
+        inline=False
+    )
+
+    embed.add_field(
+        name="🎖️ Seviye & Rank Sistemi",
+        value=(
+            "`/seviye [üye]` - Seviye ve XP durumunu gösterir.\n"
+            "`/liderlik-tablosu` - En yüksek XP sahibi 10 kişiyi listeler.\n"
+            "`/seviye-rol-ekle <seviye> <rol>` - Seviye ödülü belirler."
+        ),
         inline=False
     )
 
@@ -555,7 +748,7 @@ async def yardim(ctx: discord.ApplicationContext):
     await ctx.followup.send(embed=embed)
 
 # ==========================================
-# BOTU BAŞLATMA & OTM. OYNUYOR DURUMU
+# BOTU BAŞLATMA
 # ==========================================
 @bot.event
 async def on_ready():
