@@ -1,0 +1,4 @@
+py-cord
+feedparser
+yt-dlp
+python-dotenv
