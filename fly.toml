@@ -6,6 +6,9 @@ primary_region = 'iad'
 [[restart]]
   policy = "always"
 
+[processes]
+  app = "python bot.py"
+
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
