@@ -28,12 +28,12 @@ bot = discord.Bot(intents=intents)
 # ==========================================
 SAYMA_VERI_DOSYASI = "sayma_verisi.json"
 HABER_VERI_DOSYASI = "haber_kanallari.json"
+RSS_KAYNAK_DOSYASI = "rss_kaynaklari.json"
 KARSILAMA_VERI_DOSYASI = "karsilama_kanallari.json"
 SEVIYE_VERI_DOSYASI = "seviye_verisi.json"
 SEVIYE_ROL_DOSYASI = "seviye_rolleri.json"
 MODUL_VERI_DOSYASI = "modul_ayarlari.json"
 
-# Race-condition (dosya çakışması) engellemek için async kilit
 dosya_kilidi = asyncio.Lock()
 
 def veriyi_oku(dosya_adi):
@@ -56,6 +56,7 @@ async def veriyi_kaydet_async(dosya_adi, veri):
 # Global Hafıza Yapıları
 sayma_verileri = veriyi_oku(SAYMA_VERI_DOSYASI)
 haber_kanallari = veriyi_oku(HABER_VERI_DOSYASI)
+rss_kaynaklari = veriyi_oku(RSS_KAYNAK_DOSYASI) # { "guild_id": [ {"ad": "...", "url": "..."}, ... ] }
 karsilama_kanallari = veriyi_oku(KARSILAMA_VERI_DOSYASI)
 seviye_verileri = veriyi_oku(SEVIYE_VERI_DOSYASI)
 seviye_rolleri = veriyi_oku(SEVIYE_ROL_DOSYASI)
@@ -69,8 +70,6 @@ def get_muzik_veri(guild_id: int):
         muzik_hafizasi[guild_id] = {"kuyruk": [], "su_an_calan": None}
     return muzik_hafizasi[guild_id]
 
-# Varsayılan olarak tüm modüller AÇIK (True) varsayılır
-# Modül isimleri: "karsilama", "sayma", "rss", "muzik", "seviye", "moderasyon"
 def modul_aktif_mi(guild_id: int, modul_adi: str) -> bool:
     g_id = str(guild_id)
     return modul_ayarlari.get(g_id, {}).get(modul_adi, True)
@@ -204,7 +203,6 @@ async def on_message(message: discord.Message):
         cooldown_key = f"{guild_id}_{user_id}"
         simdiki_zaman = time.time()
 
-        # 60 Saniye Spam Koruması
         if cooldown_key not in xp_cooldown or (simdiki_zaman - xp_cooldown[cooldown_key]) >= 60:
             xp_cooldown[cooldown_key] = simdiki_zaman
 
@@ -226,7 +224,6 @@ async def on_message(message: discord.Message):
 
                 await message.channel.send(f"🎉 Tebrikler {message.author.mention}! **Seviye {yeni_seviye}** seviyesine ulaştın!")
 
-                # Otomatik Rol Ödülü
                 guild_rolleri = seviye_rolleri.get(guild_id, {})
                 if str(yeni_seviye) in guild_rolleri:
                     rol_id = guild_rolleri[str(yeni_seviye)]
@@ -344,16 +341,8 @@ async def liderlik_tablosu(ctx: discord.ApplicationContext):
     await ctx.followup.send(embed=embed)
 
 # ==========================================
-# 4. RSS HABER SİSTEMİ
+# 4. DİNAMİK RSS HABER SİSTEMİ
 # ==========================================
-HABER_KAYNAKLARI = [
-    {"ad": "The Verge", "url": "https://www.theverge.com/rss/index.xml", "renk": discord.Color.purple()},
-    {"ad": "TechCrunch", "url": "https://techcrunch.com/feed/", "renk": discord.Color.green()},
-    {"ad": "Ars Technica", "url": "http://feeds.arstechnica.com/arstechnica/index", "renk": discord.Color.orange()},
-    {"ad": "Wired", "url": "https://www.wired.com/feed/rss", "renk": discord.Color.blue()},
-    {"ad": "Hacker News", "url": "https://news.ycombinator.com/rss", "renk": discord.Color.dark_orange()}
-]
-
 gonderilen_haberler = []
 
 @bot.slash_command(name="kanal-ayarla", description="RSS haberlerinin gönderileceği kanalı belirler")
@@ -372,40 +361,116 @@ async def kanal_ayarla(ctx: discord.ApplicationContext, kanal: discord.TextChann
 
     await ctx.followup.send(f"✅ Haber kanalı bu sunucu için {kanal.mention} olarak ayarlandı!", ephemeral=True)
 
+@bot.slash_command(name="rss-ekle", description="Sunucuya yeni bir RSS haber kaynağı ekler")
+@discord.default_permissions(manage_channels=True)
+async def rss_ekle(ctx: discord.ApplicationContext, isim: str, url: str):
+    await ctx.defer(ephemeral=True)
+    if not modul_aktif_mi(ctx.guild.id, "rss"):
+        return await ctx.followup.send("❌ **RSS Haber** modülü bu sunucuda kapalı!", ephemeral=True)
+
+    if not ctx.author.guild_permissions.manage_channels:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Kanalları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
+
+    guild_id = str(ctx.guild.id)
+    if guild_id not in rss_kaynaklari:
+        rss_kaynaklari[guild_id] = []
+
+    # Geçerli bir RSS mi kontrol et
+    feed = await asyncio.to_thread(feedparser.parse, url)
+    if not feed.entries:
+        return await ctx.followup.send("❌ Belirtilen URL geçerli bir RSS kaynağı gibi görünmüyor!", ephemeral=True)
+
+    rss_kaynaklari[guild_id].append({"ad": isim, "url": url})
+    await veriyi_kaydet_async(RSS_KAYNAK_DOSYASI, rss_kaynaklari)
+
+    await ctx.followup.send(f"✅ **{isim}** adlı RSS kaynağı başarıyla eklendi!\n🔗 `{url}`", ephemeral=True)
+
+@bot.slash_command(name="rss-sil", description="Sunucudaki bir RSS haber kaynağını siler")
+@discord.default_permissions(manage_channels=True)
+async def rss_sil(ctx: discord.ApplicationContext, isim: str):
+    await ctx.defer(ephemeral=True)
+    if not modul_aktif_mi(ctx.guild.id, "rss"):
+        return await ctx.followup.send("❌ **RSS Haber** modülü bu sunucuda kapalı!", ephemeral=True)
+
+    if not ctx.author.guild_permissions.manage_channels:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Kanalları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
+
+    guild_id = str(ctx.guild.id)
+    liste = rss_kaynaklari.get(guild_id, [])
+
+    yeni_liste = [k for k in liste if k["ad"].lower() != isim.lower()]
+
+    if len(liste) == len(yeni_liste):
+        return await ctx.followup.send(f"❌ **{isim}** adında bir RSS kaynağı bulunamadı.", ephemeral=True)
+
+    rss_kaynaklari[guild_id] = yeni_liste
+    await veriyi_kaydet_async(RSS_KAYNAK_DOSYASI, rss_kaynaklari)
+
+    await ctx.followup.send(f"🗑️ **{isim}** adlı RSS kaynağı başarıyla kaldırıldı.", ephemeral=True)
+
+@bot.slash_command(name="rss-liste", description="Sunucuya ekli RSS kaynaklarını listeler")
+async def rss_liste(ctx: discord.ApplicationContext):
+    await ctx.defer()
+    if not modul_aktif_mi(ctx.guild.id, "rss"):
+        return await ctx.followup.send("❌ **RSS Haber** modülü bu sunucuda kapalı!", ephemeral=True)
+
+    guild_id = str(ctx.guild.id)
+    liste = rss_kaynaklari.get(guild_id, [])
+
+    if not liste:
+        return await ctx.followup.send("📜 Sunucuya eklenmiş hiçbir RSS kaynağı yok. `/rss-ekle` ile ekleyebilirsiniz.")
+
+    embed = discord.Embed(title=f"🌐 {ctx.guild.name} - RSS Kaynakları", color=discord.Color.blue())
+    metin = ""
+    for idx, k in enumerate(liste, start=1):
+        metin += f"**{idx}. {k['ad']}** — `<{k['url']}>` \n"
+
+    embed.description = metin
+    await ctx.followup.send(embed=embed)
+
 @tasks.loop(minutes=5)
 async def rss_kontrol():
     if not haber_kanallari:
         return
 
-    for kaynak in HABER_KAYNAKLARI:
-        try:
-            feed = await asyncio.to_thread(feedparser.parse, kaynak["url"])
-            if feed.entries:
-                son_haber = feed.entries[0]
-                if son_haber.link not in gonderilen_haberler:
-                    gonderilen_haberler.append(son_haber.link)
-                    if len(gonderilen_haberler) > 100:
-                        gonderilen_haberler.pop(0)
+    for guild_id, kaynaklar in list(rss_kaynaklari.items()):
+        if not modul_aktif_mi(int(guild_id), "rss"):
+            continue
 
-                    embed = discord.Embed(
-                        title=son_haber.title,
-                        url=son_haber.link,
-                        description=son_haber.get('summary', 'İçerik özeti yok.')[:200] + "...",
-                        color=kaynak["renk"]
-                    )
-                    embed.set_author(name=f"🌐 {kaynak['ad']}")
+        kanal_id = haber_kanallari.get(guild_id)
+        if not kanal_id:
+            continue
 
-                    for guild_id, kanal_id in list(haber_kanallari.items()):
-                        # Sunucuda RSS açık mı kontrol et
-                        if modul_aktif_mi(int(guild_id), "rss"):
-                            kanal = bot.get_channel(kanal_id)
-                            if kanal:
-                                try:
-                                    await kanal.send(embed=embed)
-                                except discord.Forbidden:
-                                    pass
-        except Exception as e:
-            print(f"[RSS HATA] {kaynak['ad']} işlenirken hata: {e}")
+        kanal = bot.get_channel(kanal_id)
+        if not kanal:
+            continue
+
+        for kaynak in kaynaklar:
+            try:
+                feed = await asyncio.to_thread(feedparser.parse, kaynak["url"])
+                if feed.entries:
+                    son_haber = feed.entries[0]
+                    haber_key = f"{guild_id}_{son_haber.link}"
+
+                    if haber_key not in gonderilen_haberler:
+                        gonderilen_haberler.append(haber_key)
+                        if len(gonderilen_haberler) > 200:
+                            gonderilen_haberler.pop(0)
+
+                        embed = discord.Embed(
+                            title=son_haber.title,
+                            url=son_haber.link,
+                            description=son_haber.get('summary', 'İçerik özeti yok.')[:200] + "...",
+                            color=discord.Color.purple()
+                        )
+                        embed.set_author(name=f"🌐 {kaynak['ad']}")
+
+                        try:
+                            await kanal.send(embed=embed)
+                        except discord.Forbidden:
+                            pass
+            except Exception as e:
+                print(f"[RSS HATA] {kaynak['ad']} işlenirken hata: {e}")
 
 # ==========================================
 # 5. MÜZİK SİSTEMİ
@@ -717,7 +782,12 @@ async def yardim(ctx: discord.ApplicationContext):
 
     embed.add_field(
         name="📰 RSS Haber Ayarları",
-        value="`/kanal-ayarla #kanal` - Haberlerin akacağı kanalı seçer.",
+        value=(
+            "`/kanal-ayarla #kanal` - Haberlerin akacağı kanalı seçer.\n"
+            "`/rss-ekle <isim> <url>` - Yeni bir haber kaynağı ekler.\n"
+            "`/rss-sil <isim>` - Ekli olan bir kaynağı kaldırır.\n"
+            "`/rss-liste` - Sunucudaki RSS kaynaklarını listeler."
+        ),
         inline=False
     )
 
