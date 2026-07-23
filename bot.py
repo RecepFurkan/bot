@@ -486,13 +486,13 @@ async def yardim(ctx: discord.ApplicationContext):
 # ==========================================
 @bot.event
 async def on_ready():
-    print(f"Bot {bot.user} adıyla aktif! Toplam {len(bot.guilds)} sunucuya hizmet veriliyor.")
-    await bot.change_presence(activity=discord.Game(name="/yardim"))
+    print(f"✅ Bot {bot.user} olarak giriş yaptı!")
     if not rss_kontrol.is_running():
         rss_kontrol.start()
+    await bot.change_presence(activity=discord.Game(name="/yardim | 7/24 Aktif"))
 
 if __name__ == "__main__":
     if DISCORD_TOKEN:
         bot.run(DISCORD_TOKEN)
     else:
-        print("❌ HATA: DISCORD_TOKEN .env dosyasında bulunamadı!")
+        print("❌ HATA: DISCORD_TOKEN bulunamadı! Lütfen environment değişkenlerini kontrol edin.")
