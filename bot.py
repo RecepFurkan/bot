@@ -22,11 +22,14 @@ intents.message_content = True
 bot = discord.Bot(intents=intents)
 
 # ==========================================
-# VERİ DEPOLAMA YARDIMCILARI (MULTI-GUILD)
+# VERİ DEPOLAMA YARDIMCILARI & KİLİT MEKANİZMASI
 # ==========================================
 SAYMA_VERI_DOSYASI = "sayma_verisi.json"
 HABER_VERI_DOSYASI = "haber_kanallari.json"
 KARSILAMA_VERI_DOSYASI = "karsilama_kanallari.json"
+
+# Eşzamanlı dosya yazma çakışmalarını önlemek için kilit
+dosya_kilidi = asyncio.Lock()
 
 def veriyi_oku(dosya_adi):
     if os.path.exists(dosya_adi):
@@ -42,15 +45,15 @@ def veriyi_kaydet(dosya_adi, veri):
         json.dump(veri, f, ensure_ascii=False, indent=4)
 
 async def veriyi_kaydet_async(dosya_adi, veri):
-    await asyncio.to_thread(veriyi_kaydet, dosya_adi, veri)
+    # Race-condition engellemek için async kilit
+    async with dosya_kilidi:
+        await asyncio.to_thread(veriyi_kaydet, dosya_adi, veri)
 
 # Global Hafıza Yapıları
-sayma_verileri = veriyi_oku(SAYMA_VERI_DOSYASI)          # { "guild_id": {"kanal_id": 123, "mevcut_sayi": 0, "son_kullanici_id": None} }
-haber_kanallari = veriyi_oku(HABER_VERI_DOSYASI)         # { "guild_id": kanal_id }
-karsilama_kanallari = veriyi_oku(KARSILAMA_VERI_DOSYASI) # { "guild_id": kanal_id }
+sayma_verileri = veriyi_oku(SAYMA_VERI_DOSYASI)
+haber_kanallari = veriyi_oku(HABER_VERI_DOSYASI)
+karsilama_kanallari = veriyi_oku(KARSILAMA_VERI_DOSYASI)
 
-# Her sunucu için ayrı müzik yapısı
-# { guild_id: {"kuyruk": [], "su_an_calan": str } }
 muzik_hafizasi = {}
 
 def get_muzik_veri(guild_id: int):
@@ -65,6 +68,11 @@ def get_muzik_veri(guild_id: int):
 @discord.default_permissions(manage_channels=True)
 async def karsilama_kanali_ayarla(ctx: discord.ApplicationContext, kanal: discord.TextChannel):
     await ctx.defer(ephemeral=True)
+    
+    # Kod içi yetki kontrolü
+    if not ctx.author.guild_permissions.manage_channels:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Kanalları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
+
     guild_id = str(ctx.guild.id)
     karsilama_kanallari[guild_id] = kanal.id
     await veriyi_kaydet_async(KARSILAMA_VERI_DOSYASI, karsilama_kanallari)
@@ -75,7 +83,6 @@ async def karsilama_kanali_ayarla(ctx: discord.ApplicationContext, kanal: discor
 async def on_member_join(member: discord.Member):
     guild_id = str(member.guild.id)
 
-    # A) SUNUCU KANALINA MESAJ (Kanal ayarlandıysa)
     kanal_id = karsilama_kanallari.get(guild_id)
     if kanal_id:
         kanal = bot.get_channel(kanal_id)
@@ -98,7 +105,6 @@ async def on_member_join(member: discord.Member):
             except discord.Forbidden:
                 print(f"[KARŞILAMA HATA] {kanal.name} kanalına mesaj gönderilemedi (Yetki eksik).")
 
-    # B) KULLANICIYA ÖZEL MESAJ (DM)
     embed_dm = discord.Embed(
         title=f"🎉 Sunucumuza Hoş Geldin, {member.name}!",
         description=(
@@ -116,19 +122,21 @@ async def on_member_join(member: discord.Member):
 
     try:
         await member.send(embed=embed_dm)
-        print(f"[KARŞILAMA DM] {member.name} ({member.guild.name}) kullanıcısına DM atıldı.")
     except discord.Forbidden:
-        print(f"[KARŞILAMA DM HATA] {member.name} kullanıcısının özel mesajları kapalı.")
+        pass
 
 # ==========================================
-# 2. SAYMA (COUNTING) SİSTEMİ (MULTI-GUILD)
+# 2. SAYMA (COUNTING) SİSTEMİ
 # ==========================================
 @bot.slash_command(name="sayma-kanali-ayarla", description="Sayma oyununun oynanacağı kanalı belirler")
 @discord.default_permissions(manage_channels=True)
 async def sayma_kanali_ayarla(ctx: discord.ApplicationContext, kanal: discord.TextChannel):
     await ctx.defer(ephemeral=True)
-    guild_id = str(ctx.guild.id)
     
+    if not ctx.author.guild_permissions.manage_channels:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Kanalları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
+
+    guild_id = str(ctx.guild.id)
     sayma_verileri[guild_id] = {
         "kanal_id": kanal.id,
         "mevcut_sayi": 0,
@@ -146,7 +154,6 @@ async def on_message(message: discord.Message):
     guild_id = str(message.guild.id)
     guild_sayma = sayma_verileri.get(guild_id)
 
-    # Sunucuya ait sayma kanalı kontrolü
     if guild_sayma and guild_sayma.get("kanal_id") == message.channel.id:
         içerik = message.content.strip()
 
@@ -154,7 +161,6 @@ async def on_message(message: discord.Message):
             girilen_sayi = int(içerik)
             beklenen_sayi = guild_sayma["mevcut_sayi"] + 1
 
-            # Kural 1: Üst üste iki kez aynı kişi yazamaz
             if message.author.id == guild_sayma.get("son_kullanici_id"):
                 await message.add_reaction("❌")
                 guild_sayma["mevcut_sayi"] = 0
@@ -163,7 +169,6 @@ async def on_message(message: discord.Message):
                 await message.channel.send(f"⚠️ **{message.author.mention}**, üst üste iki kez sayı yazamazsın! Sayma sıfırlandı. Tekrar **1** yazarak başlayın.")
                 return
 
-            # Kural 2: Sıradaki sayı doğru mu?
             if girilen_sayi == beklenen_sayi:
                 await message.add_reaction("✅")
                 guild_sayma["mevcut_sayi"] = girilen_sayi
@@ -179,7 +184,7 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 # ==========================================
-# 3. RSS HABER VE ÇOKLU KANAL YAYINI
+# 3. RSS HABER SİSTEMİ
 # ==========================================
 HABER_KAYNAKLARI = [
     {"ad": "The Verge", "url": "https://www.theverge.com/rss/index.xml", "renk": discord.Color.purple()},
@@ -195,6 +200,10 @@ gonderilen_haberler = []
 @discord.default_permissions(manage_channels=True)
 async def kanal_ayarla(ctx: discord.ApplicationContext, kanal: discord.TextChannel):
     await ctx.defer(ephemeral=True)
+    
+    if not ctx.author.guild_permissions.manage_channels:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Kanalları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
+
     guild_id = str(ctx.guild.id)
     haber_kanallari[guild_id] = kanal.id
     await veriyi_kaydet_async(HABER_VERI_DOSYASI, haber_kanallari)
@@ -235,7 +244,7 @@ async def rss_kontrol():
             print(f"[RSS HATA] {kaynak['ad']} işlenirken hata: {e}")
 
 # ==========================================
-# 4. MÜZİK VE KUYRUK SİSTEMİ (MULTI-GUILD)
+# 4. MÜZİK SİSTEMİ (SES KANALI GÜVENLİĞİ EKLENDİ)
 # ==========================================
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
@@ -268,19 +277,35 @@ def sonraki_sarkiyi_cal(ctx):
     else:
         m_veri["su_an_calan"] = None
 
+async def ses_kanali_kontrol(ctx: discord.ApplicationContext) -> bool:
+    """Kullanıcının ve botun ses kanalı durumlarını denetler."""
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        await ctx.followup.send("❌ Bu komutu kullanmak için bir ses kanalında olmalısınız!", ephemeral=True)
+        return False
+
+    if ctx.voice_client and ctx.voice_client.channel != ctx.author.voice.channel:
+        await ctx.followup.send("❌ Bot ile aynı ses kanalında olmalısınız!", ephemeral=True)
+        return False
+
+    return True
+
 @bot.slash_command(name="oynat", description="Şarkı çalar veya sıraya ekler")
 async def oynat(ctx: discord.ApplicationContext, arama: str):
     await ctx.defer()
-    m_veri = get_muzik_veri(ctx.guild.id)
-
-    if not ctx.author.voice:
-        return await ctx.followup.send("❌ Önce bir ses kanalına katılmalısın!")
+    
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.followup.send("❌ Önce bir ses kanalına katılmalısınız!", ephemeral=True)
 
     voice_channel = ctx.author.voice.channel
     voice_client = ctx.voice_client
 
+    # Ses kanalına bağlanma / kanal değiştirme kontrolü
     if not voice_client:
         voice_client = await voice_channel.connect()
+    elif voice_client.channel != voice_channel:
+        await voice_client.move_to(voice_channel)
+
+    m_veri = get_muzik_veri(ctx.guild.id)
 
     try:
         info = await asyncio.to_thread(lambda: ytdl.extract_info(f"ytsearch:{arama}", download=False))
@@ -301,11 +326,13 @@ async def oynat(ctx: discord.ApplicationContext, arama: str):
             voice_client.play(source, after=lambda e: sonraki_sarkiyi_cal(ctx))
             await ctx.followup.send(f"🎵 **Şimdi Çalıyor:** {sarki['title']}")
     except Exception as e:
-        await ctx.followup.send(f"❌ Şarkı aranırken/çalınırken bir hata oluştu: {e}")
+        await ctx.followup.send(f"❌ Şarkı işlenirken bir hata oluştu: {e}")
 
 @bot.slash_command(name="duraklat", description="Çalan müziği duraklatır")
 async def duraklat(ctx: discord.ApplicationContext):
     await ctx.defer()
+    if not await ses_kanali_kontrol(ctx): return
+
     if ctx.voice_client and ctx.voice_client.is_playing():
         ctx.voice_client.pause()
         await ctx.followup.send("⏸️ Müzik duraklatıldı.")
@@ -315,6 +342,8 @@ async def duraklat(ctx: discord.ApplicationContext):
 @bot.slash_command(name="devam", description="Duraklatılan müziği devam ettirir")
 async def devam(ctx: discord.ApplicationContext):
     await ctx.defer()
+    if not await ses_kanali_kontrol(ctx): return
+
     if ctx.voice_client and ctx.voice_client.is_paused():
         ctx.voice_client.resume()
         await ctx.followup.send("▶️ Müzik devam ettiriliyor.")
@@ -324,6 +353,8 @@ async def devam(ctx: discord.ApplicationContext):
 @bot.slash_command(name="atla", description="Sıradaki şarkıya geçer")
 async def atla(ctx: discord.ApplicationContext):
     await ctx.defer()
+    if not await ses_kanali_kontrol(ctx): return
+
     if ctx.voice_client and (ctx.voice_client.is_playing() or ctx.voice_client.is_paused()):
         ctx.voice_client.stop()
         await ctx.followup.send("⏭️ Şarkı atlandı!")
@@ -355,6 +386,8 @@ async def liste(ctx: discord.ApplicationContext):
 @bot.slash_command(name="dur", description="Müziği durdurur ve kuyruğu temizler")
 async def dur(ctx: discord.ApplicationContext):
     await ctx.defer()
+    if not await ses_kanali_kontrol(ctx): return
+
     m_veri = get_muzik_veri(ctx.guild.id)
     m_veri["kuyruk"].clear()
     m_veri["su_an_calan"] = None
@@ -366,12 +399,15 @@ async def dur(ctx: discord.ApplicationContext):
         await ctx.followup.send("❌ Zaten bir ses kanalında değilim.")
 
 # ==========================================
-# 5. MODERASYON KOMUTLARI
+# 5. MODERASYON KOMUTLARI (HİYERARŞİ VE YETKİ KONTROLÜ)
 # ==========================================
 @bot.slash_command(name="clear", description="Belirtilen miktarda mesajı siler")
 @discord.default_permissions(manage_messages=True)
 async def clear(ctx: discord.ApplicationContext, miktar: int):
     await ctx.defer(ephemeral=True)
+
+    if not ctx.author.guild_permissions.manage_messages:
+        return await ctx.followup.send("❌ Bu komut için `Mesajları Yönet` yetkisine sahip olmalısınız!", ephemeral=True)
 
     if miktar < 1 or miktar > 100:
         return await ctx.followup.send("❌ Lütfen 1 ile 100 arasında bir sayı girin.", ephemeral=True)
@@ -380,7 +416,7 @@ async def clear(ctx: discord.ApplicationContext, miktar: int):
         silinen = await ctx.channel.purge(limit=miktar)
         await ctx.followup.send(f"🧹 **{len(silinen)}** adet mesaj temizlendi.", ephemeral=True)
     except discord.Forbidden:
-        await ctx.followup.send("❌ Botun bu kanalda **Mesajları Yönet** yetkisi yok!", ephemeral=True)
+        await ctx.followup.send("❌ Botun bu kanalda `Mesajları Yönet` yetkisi yok!", ephemeral=True)
     except discord.HTTPException as e:
         await ctx.followup.send(f"❌ Mesajlar silinirken hata oluştu (14 günden eski mesajlar silinemez): {e}", ephemeral=True)
 
@@ -388,6 +424,17 @@ async def clear(ctx: discord.ApplicationContext, miktar: int):
 @discord.default_permissions(kick_members=True)
 async def kick(ctx: discord.ApplicationContext, üye: discord.Member, sebep: str = "Belirtilmedi"):
     await ctx.defer()
+
+    if not ctx.author.guild_permissions.kick_members:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Üyeleri At` yetkisine sahip olmalısınız!", ephemeral=True)
+
+    # Rol Hiyerarşisi Kontrolü
+    if üye.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        return await ctx.followup.send("❌ Sizinle aynı veya sizden daha yüksek roldeki birini atamazsınız!", ephemeral=True)
+
+    if üye.top_role >= ctx.guild.me.top_role:
+        return await ctx.followup.send("❌ Bu kullanıcının rolü benim rolümden yüksek veya eşit, onu atamam!", ephemeral=True)
+
     try:
         await üye.kick(reason=sebep)
         await ctx.followup.send(f"👞 **{üye.mention}** sunucudan atıldı. *(Sebep: {sebep})*")
@@ -398,6 +445,17 @@ async def kick(ctx: discord.ApplicationContext, üye: discord.Member, sebep: str
 @discord.default_permissions(ban_members=True)
 async def ban(ctx: discord.ApplicationContext, üye: discord.Member, sebep: str = "Belirtilmedi"):
     await ctx.defer()
+
+    if not ctx.author.guild_permissions.ban_members:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Üyeleri Yasakla` yetkisine sahip olmalısınız!", ephemeral=True)
+
+    # Rol Hiyerarşisi Kontrolü
+    if üye.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        return await ctx.followup.send("❌ Sizinle aynı veya sizden daha yüksek roldeki birini yasaklayamazsınız!", ephemeral=True)
+
+    if üye.top_role >= ctx.guild.me.top_role:
+        return await ctx.followup.send("❌ Bu kullanıcının rolü benim rolümden yüksek veya eşit, onu yasaklayamam!", ephemeral=True)
+
     try:
         await üye.ban(reason=sebep)
         await ctx.followup.send(f"🔨 **{üye.mention}** sunucudan yasaklandı. *(Sebep: {sebep})*")
@@ -408,6 +466,17 @@ async def ban(ctx: discord.ApplicationContext, üye: discord.Member, sebep: str 
 @discord.default_permissions(moderate_members=True)
 async def mute(ctx: discord.ApplicationContext, üye: discord.Member, dakika: int, sebep: str = "Belirtilmedi"):
     await ctx.defer()
+
+    if not ctx.author.guild_permissions.moderate_members:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Üyeleri Zamana Aşımına Uğrat` yetkisine sahip olmalısınız!", ephemeral=True)
+
+    # Rol Hiyerarşisi Kontrolü
+    if üye.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+        return await ctx.followup.send("❌ Sizinle aynı veya sizden daha yüksek roldeki birini susturamazsınız!", ephemeral=True)
+
+    if üye.top_role >= ctx.guild.me.top_role:
+        return await ctx.followup.send("❌ Bu kullanıcının rolü benim rolümden yüksek veya eşit, onu susturamam!", ephemeral=True)
+
     try:
         süre = timedelta(minutes=dakika)
         await üye.timeout_for(duration=süre, reason=sebep)
@@ -419,6 +488,10 @@ async def mute(ctx: discord.ApplicationContext, üye: discord.Member, dakika: in
 @discord.default_permissions(moderate_members=True)
 async def unmute(ctx: discord.ApplicationContext, üye: discord.Member):
     await ctx.defer()
+
+    if not ctx.author.guild_permissions.moderate_members:
+        return await ctx.followup.send("❌ Bu komutu kullanmak için `Üyeleri Zamana Aşımına Uğrat` yetkisine sahip olmalısınız!", ephemeral=True)
+
     try:
         await üye.remove_timeout()
         await ctx.followup.send(f"🔊 **{üye.mention}** kullanıcısının susturması kaldırıldı.")
