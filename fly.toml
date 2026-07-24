@@ -1,3 +1,6 @@
+[tool.vercel]
+entrypoint = "main.py"
+
 app = 'bot-rfbb'
 primary_region = 'iad'
 
